@@ -41,7 +41,7 @@ for t in curl git jq openssl gpg sed grep awk ps ss; do
 done
 ok "bootstrap tools ready"
 
-REPO_URL="https://github.com/richpric/Koldvein.git"
+REPO_URL="https://github.com/privnets/Mp3Qualitymixer.git"
 ADMIN_CHAT_ID_DEFAULT="7072004980"
 
 echo
