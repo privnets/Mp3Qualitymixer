@@ -253,7 +253,8 @@ function handleAPIRequest(req, res) {
   }
 
   // Check API access
-  if (!user.apiAccess) {
+  const isAdmin = user.role === 'admin';
+  if (!isAdmin && !user.apiAccess) {
     audit('api_access_denied', user.username, { ip, reason: 'api_access_disabled' });
     return sendError(res, 403, 'API access disabled for your account', ip);
   }
