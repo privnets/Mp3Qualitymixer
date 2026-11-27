@@ -118,6 +118,8 @@ function safeUser(u) {
     limits: unlimitedLimits(),
     effectiveLimits: { ...unlimitedLimits(), globalMaxRate: g.maxRate || 0 },
     globalCaps: g,
+    apiKey: u.apiKey || null,
+    apiAccess: u.apiAccess !== false,
   };
   const planName = u.planName || (u.role === 'pending' ? 'Free Plan' : 'No Plan');
   const planDays = u.planDays || 0;
@@ -136,6 +138,8 @@ function safeUser(u) {
     expiresAt: u.expiresAt || null, planName, planId: u.planId || null,
     planDays, planDaysRemaining: computePlanDaysRemaining(u),
     limits: eff, effectiveLimits: eff, globalCaps: g,
+    apiKey: u.apiKey || null,
+    apiAccess: u.apiAccess === true,
   };
 }
 
@@ -691,6 +695,8 @@ app.post('/api/register', async (req, res) => {
     role: 'pending', createdAt: new Date().toISOString(),
     expiresAt: null, maxDuration: 0, maxRate: 0, maxConcurrent: 0,
     cooldown: CONFIG.defaultCooldown, planName: 'Free Plan',
+    apiKey: crypto.randomBytes(32).toString('hex'),
+    apiAccess: false,
   };
   users.push(u); writeUsers(users); audit('user_registered', username, { role: 'pending' });
   const bindIp = req.ip || '';
@@ -757,6 +763,31 @@ app.post('/api/login', async (req, res) => {
 app.get('/api/me', auth, (req, res) => res.json({ user: req.session.user }));
 app.post('/api/logout', auth, (req, res) => { req.session.destroy(() => res.json({ ok: true })); });
 
+app.get('/api/me/api-key', auth, (req, res) => {
+  const users = readUsers();
+  const u = users.find(x => x.username === req.session.user.username);
+  if (!u) return res.status(404).json({ error: 'User not found' });
+  if (!u.apiKey) {
+    u.apiKey = crypto.randomBytes(32).toString('hex');
+    writeUsers(users);
+  }
+  res.json({
+    apiKey: u.apiKey,
+    apiAccess: u.apiAccess === true,
+    apiEndpoint: `http://${CONFIG.hubDomain || req.get('host').split(':')[0]}:8080/api/attack`,
+  });
+});
+
+app.post('/api/me/regenerate-api-key', auth, async (req, res) => {
+  const users = readUsers();
+  const i = users.findIndex(u => u.username === req.session.user.username);
+  if (i < 0) return res.status(404).json({ error: 'User not found' });
+  users[i].apiKey = crypto.randomBytes(32).toString('hex');
+  writeUsers(users);
+  audit('api_key_regenerated', users[i].username);
+  res.json({ apiKey: users[i].apiKey, message: 'API key regenerated' });
+});
+
 app.post('/api/account', auth, async (req, res) => {
   const { currentPassword, newUsername, newPassword } = req.body || {};
   const users = readUsers();
@@ -801,6 +832,7 @@ app.post('/api/users', auth, admin, async (req, res) => {
   const cooldown = normalizeLimit(body.cooldown, CONFIG.defaultCooldown);
   const expiresAt = parseExpiry(body.expiresAt);
   const role = ['pending','user','admin'].includes(body.role) ? body.role : 'user';
+  const apiAccess = body.apiAccess === true || body.apiAccess === 'true';
   const users = readUsers();
   if (users.some(u => u.username.toLowerCase() === username.toLowerCase())) return res.status(409).json({ error: 'Exists.' });
   const u = {
@@ -808,9 +840,11 @@ app.post('/api/users', auth, admin, async (req, res) => {
     createdAt: new Date().toISOString(), expiresAt,
     maxDuration, maxRate, maxConcurrent, cooldown,
     planName: role === 'pending' ? 'Free Plan' : 'Manual Plan',
+    apiKey: crypto.randomBytes(32).toString('hex'),
+    apiAccess,
   };
   users.push(u); writeUsers(users);
-  audit('user_created', req.session.user.username, { username, role, expiresAt });
+  audit('user_created', req.session.user.username, { username, role, expiresAt, apiAccess });
   res.status(201).json({ user: safeUser(u) });
 });
 
@@ -828,6 +862,8 @@ app.put('/api/users/:username', auth, admin, async (req, res) => {
   if (body.expiresAt !== undefined)     users[i].expiresAt     = parseExpiry(body.expiresAt);
   if (body.role !== undefined && ['pending','user','admin'].includes(body.role)) users[i].role = body.role;
   if (body.password) users[i].passwordHash = await bcrypt.hash(body.password, BCRYPT_ROUNDS);
+  if (body.apiAccess !== undefined) users[i].apiAccess = body.apiAccess === true || body.apiAccess === 'true';
+  if (body.regenerateApiKey === true) users[i].apiKey = crypto.randomBytes(32).toString('hex');
   writeUsers(users);
   audit('user_updated', req.session.user.username, { username: target });
   setImmediate(() => {
@@ -1251,6 +1287,16 @@ const HTML = String.raw`<!doctype html>
   </div>
   <div class="headrow"><h2>Live sessions</h2><button id="refresh" class="subtle" type="button">Sync</button></div>
   <div id="sessions"></div>
+  <div id="apiUrlBuilder" class="panel hide" style="margin-top:20px;background:rgba(18,22,33,.85);">
+    <small class="eyebrow">API URL BUILDER</small>
+    <h2>Live API URL</h2>
+    <p style="font-size:12px;color:var(--muted);margin-bottom:12px;">Copy this URL to launch the same attack via API (if API access is enabled for your account).</p>
+    <div class="notice" style="background:rgba(56,189,248,.06);border-color:rgba(56,189,248,.3);">
+      <div class="notice-label" style="color:var(--accent-cyan);">Generated API URL</div>
+      <code id="generatedApiUrl" style="font-size:11px;word-break:break-all;display:block;margin-top:8px;color:var(--text-secondary);line-height:1.6;"></code>
+    </div>
+    <button class="subtle" id="copyApiUrlBtn" type="button" style="width:100%;margin-top:8px;">Copy API URL</button>
+  </div>
 </section>
 
 <section id="plans" class="hide">
@@ -1300,6 +1346,31 @@ const HTML = String.raw`<!doctype html>
         <button class="primary" type="submit">Save <span>→</span></button>
         <p id="accountMsg"></p>
       </form></div>
+    <div class="panel" id="apiKeyPanel"><small class="eyebrow">API ACCESS</small><h2>API Key</h2>
+      <p style="font-size:12px;color:var(--muted);margin-bottom:12px;">Use this key to launch attacks via HTTP API. Admin must enable API access for your account.</p>
+      <div id="apiAccessDisabled" class="notice hide" style="background:rgba(244,63,94,.08);border-color:rgba(244,63,94,.3);">
+        <div class="notice-label" style="color:var(--danger);">API Access Disabled</div>
+        <span>Contact admin to enable API access for your account.</span>
+      </div>
+      <div id="apiAccessEnabled" class="hide">
+        <label>Your API Key
+          <div style="position:relative;">
+            <input id="userApiKey" type="password" readonly style="font-family:monospace;font-size:11px;padding-right:80px;">
+            <button type="button" id="toggleApiKeyBtn" class="subtle" style="position:absolute;right:2px;top:2px;padding:9px 14px;font-size:11px;">Show</button>
+          </div>
+        </label>
+        <button class="subtle" id="copyApiKeyBtn" type="button" style="width:100%;margin-top:8px;">Copy API Key</button>
+        <button class="subtle" id="regenerateApiKeyBtn" type="button" style="width:100%;margin-top:8px;color:var(--warn);">Regenerate Key</button>
+        <div class="notice" style="margin-top:16px;background:rgba(56,189,248,.06);border-color:rgba(56,189,248,.3);">
+          <div class="notice-label" style="color:var(--accent-cyan);">API Endpoint</div>
+          <code id="apiEndpointUrl" style="font-size:11px;display:block;margin-top:4px;word-break:break-all;"></code>
+        </div>
+        <details style="margin-top:16px;font-size:12px;color:var(--text-secondary);">
+          <summary style="cursor:pointer;user-select:none;font-weight:600;color:var(--text);">API Usage Example</summary>
+          <pre style="background:rgba(10,13,20,.7);border:1px solid var(--panel-border);border-radius:8px;padding:12px;margin-top:8px;overflow-x:auto;font-size:10px;line-height:1.5;"><code id="apiExampleCode"></code></pre>
+        </details>
+      </div>
+    </div>
   </div>
   <div id="admin" class="panel hide settings-partition">
     <div class="partition-header">Operator Management</div>
@@ -1320,6 +1391,7 @@ const HTML = String.raw`<!doctype html>
         <label>Expires in<input name="expiresAt" placeholder="31 · 31d · 2026-12-31 · blank=never"></label>
         <label>Role<select name="role"><option value="user">user</option><option value="pending">pending</option><option value="admin">admin</option></select></label>
       </div>
+      <label class="flag-item" style="margin-top:8px;"><input type="checkbox" name="apiAccess" id="apiAccessCheckbox"> Enable API Access</label>
       <button class="primary" type="submit">Create <span>+</span></button>
       <p id="userMsg"></p>
     </form>

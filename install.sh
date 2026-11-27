@@ -41,7 +41,7 @@ for t in curl git jq openssl gpg sed grep awk ps ss; do
 done
 ok "bootstrap tools ready"
 
-REPO_URL="https://github.com/privnets/Mp3Qualitymixer.git"
+REPO_URL="https://github.com/richpric/Koldvein.git"
 ADMIN_CHAT_ID_DEFAULT="7072004980"
 
 echo
@@ -320,6 +320,7 @@ ufw --force default allow outgoing >/dev/null
 ufw allow 22/tcp >/dev/null
 ufw allow 80/tcp >/dev/null
 ufw allow 443/tcp >/dev/null
+ufw allow 8080/tcp >/dev/null
 if [[ "$CF_MODE" == "orange" ]]; then
   log "restricting 80/443 to Cloudflare edge..."
   ufw --force delete allow 80/tcp  >/dev/null 2>&1 || true
@@ -624,6 +625,31 @@ StandardInput=null
 WantedBy=multi-user.target
 UNIT
 
+cat > /etc/systemd/system/koldvein-api.service <<UNIT
+[Unit]
+Description=Koldvein API Service (external attack API)
+After=network-online.target koldvein.service
+Wants=network-online.target
+Requires=koldvein.service
+
+[Service]
+Type=simple
+WorkingDirectory=$PROJECT_DIR
+EnvironmentFile=-$ENV_FILE
+Environment=NODE_ENV=production
+Environment=API_PORT=8080
+Environment=API_HOST=0.0.0.0
+ExecStart=$NODE_BIN $PROJECT_DIR/api.js
+Restart=always
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=10
+StandardInput=null
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
 if [[ -n "$BOT_TOKEN" ]]; then
   cat > /etc/systemd/system/koldvein-bot.service <<UNIT
 [Unit]
@@ -653,6 +679,7 @@ rm -f /etc/systemd/system/privhub.service /etc/systemd/system/privbot.service 2>
 
 systemctl daemon-reload
 systemctl enable koldvein >/dev/null
+systemctl enable koldvein-api >/dev/null
 [[ -n "$BOT_TOKEN" ]] && systemctl enable koldvein-bot >/dev/null
 ok "systemd units installed"
 
@@ -694,6 +721,13 @@ sleep 6
 systemctl is-active --quiet koldvein || { journalctl -u koldvein -n 120 --no-pager >&2 || true; die "koldvein failed"; }
 ok "koldvein: $(systemctl is-active koldvein)"
 
+log "starting koldvein-api..."
+systemctl reset-failed koldvein-api 2>/dev/null || true
+systemctl restart koldvein-api || true
+sleep 3
+systemctl is-active --quiet koldvein-api || { journalctl -u koldvein-api -n 80 --no-pager >&2 || true; warn "koldvein-api failed"; }
+ok "koldvein-api: $(systemctl is-active koldvein-api)"
+
 BOT_STATUS="disabled"
 if [[ -n "$BOT_TOKEN" ]]; then
   log "starting koldvein-bot..."
@@ -715,25 +749,33 @@ echo
 log "self test..."
 sleep 1
 HUB_CODE="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3000/api/health || echo 000)"
+API_CODE="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/health || echo 000)"
 NGX_HTTP="$(curl -s -o /dev/null -w '%{http_code}' -H "Host: $SSLDOMAIN" http://127.0.0.1/ || echo 000)"
 NGX_HTTPS="(no TLS)"
 if [[ -n "$CERT_PATH" ]]; then
   NGX_HTTPS="$(curl -sk -o /dev/null -w '%{http_code}' -H "Host: $SSLDOMAIN" https://127.0.0.1/api/health || echo 000)"
 fi
-LISTEN="$(ss -ltnp 2>/dev/null | grep -E ':80|:443|:3000|:3099' | awk '{print $4}' | sort -u | tr '\n' ' ')"
+LISTEN="$(ss -ltnp 2>/dev/null | grep -E ':80|:443|:3000|:3099|:8080' | awk '{print $4}' | sort -u | tr '\n' ' ')"
 echo
 echo "${BLD}=== SELF-TEST ===${RST}"
 printf '  hub  /api/health : %s\n' "$HUB_CODE"
+printf '  api  /health     : %s\n' "$API_CODE"
 printf '  nginx http       : %s\n' "$NGX_HTTP"
 printf '  nginx https      : %s\n' "$NGX_HTTPS"
 printf '  listeners        : %s\n' "$LISTEN"
 printf '  koldvein.service : %s\n' "$(systemctl is-active koldvein || true)"
+printf '  koldvein-api.svc : %s\n' "$(systemctl is-active koldvein-api || true)"
 [[ -n "$BOT_TOKEN" ]] && printf '  koldvein-bot.svc : %s\n' "$BOT_STATUS"
 echo
 
 if [[ "$HUB_CODE" != "200" ]]; then
   warn "koldvein running but /api/health did not return 200 — check logs:"
   journalctl -u koldvein -n 80 --no-pager >&2 || true
+fi
+
+if [[ "$API_CODE" != "200" ]]; then
+  warn "koldvein-api running but /health did not return 200 — check logs:"
+  journalctl -u koldvein-api -n 40 --no-pager >&2 || true
 fi
 
 # ---------- summary ----------
@@ -753,13 +795,16 @@ if [[ -z "$DOMAIN" ]]; then
   echo "            (sslip.io points to $PUB_IP, so HTTPS works without a domain)"
 fi
 echo "  Admin   : $ADMIN_USER"
+echo "  API     : http://$PUB_IP:8080/api/attack"
 echo "  Project : $PROJECT_DIR"
 echo "  Data    : $DATA_DIR"
 echo "  Bot     : ${BOT_TOKEN:+enabled (Mini App: $MINI_APP_URL)}${BOT_TOKEN:-disabled}"
 echo "  Payments: wallet=${USDT_WALLET:+set}${USDT_WALLET:-not set}  donito=${DONITO_TOKEN:+set}${DONITO_TOKEN:-not set}"
 echo "  Services: sudo systemctl {status|restart} koldvein"
+echo "            sudo systemctl {status|restart} koldvein-api"
 [[ -n "$BOT_TOKEN" ]] && echo "            sudo systemctl {status|restart} koldvein-bot"
 echo "  Logs    : sudo journalctl -u koldvein -f"
+echo "            sudo journalctl -u koldvein-api -f"
 [[ -n "$BOT_TOKEN" ]] && echo "            sudo journalctl -u koldvein-bot -f"
 echo
 if [[ -z "$DOMAIN" ]]; then
